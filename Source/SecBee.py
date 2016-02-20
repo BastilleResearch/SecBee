@@ -1,3 +1,5 @@
+#!/usr/bin/env python2
+
 from ZBDevice import *
 from Tkinter import *
 import pickle
@@ -16,32 +18,105 @@ import socket
 import zigbee_transkey
 from subprocess import call
 import ConfigParser
+import time
 
 known_devices = []
 network_keys = []
 seen_packets = []
 source_choices = []
-send_packet = False
+#send_packet = False     # FIXME: Remove
 send_acks = False
-acknowledged = []
+#acknowledged = []       # FIXME: Remove
+#last_acknowledged = -1  # FIXME: Remove
+#last_pending_seqnum = -1    # Should be per-device
+sent_packets = []
+
 #beacon_dot15d4_seqnum = 23
-active_networkkey = "144221a817f284c7e6e1f000cd80ff0f".decode('hex')
+beacon_dot15d4_seqnum = 0
+
+# MAKE SURE YOU SET THIS IN "secbee.conf"
+active_networkkey = ""
+#active_networkkey = "144221a817f284c7e6e1f000cd80ff0f".decode('hex')
 #active_networkkey = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".decode('hex')
-i = 0
 
 zb_defaultkey = ""
 networkkeys_file = ""
 knowndevices_file = ""
 
-
 #defaultkey = '5a6967426565416c6c69616e63653039'.decode('hex')
 zb_defaultkey = "ZigBeeAlliance09"
+
+PRUNE_TIMEOUT = 1.0
+
+def _prune_tracked_send():
+    global sent_packets
+
+    time_now = time.time()
+    i = 0
+    pruned_cnt = 0
+    while i < len(sent_packets):
+        p = sent_packets[i]
+        diff = time_now - p[0]
+        if diff >= PRUNE_TIMEOUT:
+            #print "[Pruning: %s after %f]" % (p[1].summary(), diff)
+            del sent_packets[i]
+            pruned_cnt += 1
+        else:
+            i += 1
+
+    #print "[Pruned %d sent packets]" % (pruned_cnt)
+
+def tracked_send(packets):
+    global sent_packets
+
+    _prune_tracked_send()
+
+    if not isinstance(packets, list):
+        packets = [packets]
+
+    time_now = time.time()
+
+    for p in packets:
+        sent_packets += [(time_now, p)]
+        #print "[Added: %s]" % (p.summary())
+
+    #print "[Sent packet list: %d items]" % (len(sent_packets))
+
+    try:
+        send(packets, verbose=False)
+    except Exception, e:
+        print "Failed to send %d packets: %s" % (len(packets), str(e))
+        raise e
+
+def is_sent_packet(packet):
+    global sent_packets
+
+    _prune_tracked_send()
+
+    #print "[Checking %d packets against: %s \"%s\"]" % (len(sent_packets), packet.summary(), str(packet.do_build()).encode('hex'))
+
+    for p in sent_packets:
+        #print "\t%s \"%s\"" % (p[1].summary(), str(p[1].do_build()).encode('hex'))
+        #if packet == p[1]: # This doesn't work for the more complex ZB packets?
+        try:
+            if packet.do_build() == p[1].do_build():
+                return True
+        except Exception, e:    # In case it doesn't build
+            print "Failed to build packet during sent comparison:", e
+
+    return False
 
 class MyThread(threading.Thread):
  
     def run(self):
         _seen = dict()
-        sniffradio( radio="Zigbee", prn=lambda p, se=_seen: self.handle_packets(p, se), lfilter=lambda x: x.haslayer(Dot15d4Data))
+
+        sniffradio(
+            radio="Zigbee",
+            prn=lambda p, se=_seen: self.handle_packets(p, se),
+            #lfilter=lambda x: x.haslayer(Dot15d4Data)
+            lfilter=lambda x: x.haslayer(Dot15d4FCS)
+        )
 
     def extract_infos(self, packet):
         global known_devices
@@ -90,9 +165,8 @@ class MyThread(threading.Thread):
 
                 return
 
+        print "New device found!"
 
-
-        print "New device found"
         new_device = ZBDevice()
         new_device.short_address = copy.deepcopy(packet.src_addr)
         new_device.dot15d4_seqnumber = copy.deepcopy(packet.getlayer(Dot15d4FCS).seqnum)
@@ -123,34 +197,44 @@ class MyThread(threading.Thread):
         source_choices.append(str(len(source_choices))+" ("+str(new_device.short_address)+")")
         return 
 
-    def update_counter(self,device,packet):
-
+    def update_counter(self, device, packet):
         if packet.haslayer(ZigbeeNWK):
             device.zb_nwk_seqnumber = copy.deepcopy(packet.getlayer(ZigbeeNWK).seqnum)
+
         if packet.haslayer(ZigbeeSecurityHeader):
             device.frame_counter = copy.deepcopy(packet.getlayer(ZigbeeSecurityHeader).fc)
             
             if str(packet.getlayer(ZigbeeSecurityHeader).source) is not 'None':
-                dec_payload = scapy.killerbee.kbdecrypt(packet, active_networkkey,1)
-                if dec_payload.haslayer(ZigbeeAppDataPayload):
 
-                    #check for ACK -> no update
-                    if dec_payload.aps_frametype == 2L:
-                        return device
+                try:
+                    dec_payload = scapy.killerbee.kbdecrypt(packet, active_networkkey, 1)
 
-                    print "Source " + str(packet.src_addr)
-                    print "Counter " +str(dec_payload.getlayer(ZigbeeAppDataPayload).counter)
-                    device.zb_zadp_counter = copy.deepcopy(dec_payload.getlayer(ZigbeeAppDataPayload).counter)
-                    if dec_payload.cluster==1280:
-                        print "Motion trans seq " +str(int(dec_payload.load[1].encode('hex'),16))
-                        device.zb_zcl_trans_seq = copy.deepcopy(int(dec_payload.load[1].encode('hex'),16))
-                    elif dec_payload.haslayer(ZigbeeDeviceProfile):
-                        print "ZDP Seqnumber"+str(dec_payload.sequence_number)
-                        device.zb_zcl_trans_seq = copy.deepcopy(dec_payload.sequence_number)
-                    else:
-                        if dec_payload.haslayer(ZigbeeClusterLibrary):
-                            print "trans seq " +str(dec_payload.getlayer(ZigbeeClusterLibrary).transaction_sequence)
-                            device.zb_zcl_trans_seq = copy.deepcopy(dec_payload.getlayer(ZigbeeClusterLibrary).transaction_sequence)
+                    if dec_payload.haslayer(ZigbeeAppDataPayload):
+
+                        #check for ACK -> no update
+                        if dec_payload.aps_frametype == 2L:
+                            return device
+
+                        print "Source addr:  " + str(packet.src_addr)
+                        print "\tCounter:      " + str(dec_payload.getlayer(ZigbeeAppDataPayload).counter)
+
+                        device.zb_zadp_counter = copy.deepcopy(dec_payload.getlayer(ZigbeeAppDataPayload).counter)
+
+                        if dec_payload.cluster==1280:
+                            print "\tMotion trans seq: " +str(int(dec_payload.load[1].encode('hex'),16))
+                            device.zb_zcl_trans_seq = copy.deepcopy(int(dec_payload.load[1].encode('hex'),16))
+                        elif dec_payload.haslayer(ZigbeeDeviceProfile):
+                            print "\tZDP Seq number: "+str(dec_payload.sequence_number)
+                            device.zb_zcl_trans_seq = copy.deepcopy(dec_payload.sequence_number)
+                        else:
+                            if dec_payload.haslayer(ZigbeeClusterLibrary):
+                                print "\tZCL Trans Seq: " +str(dec_payload.getlayer(ZigbeeClusterLibrary).transaction_sequence)
+                                device.zb_zcl_trans_seq = copy.deepcopy(dec_payload.getlayer(ZigbeeClusterLibrary).transaction_sequence)
+
+                        print
+                except Exception, e:
+                    print "Failed to decrypt payload:", e
+                    print
 
         return device
 
@@ -186,8 +270,8 @@ class MyThread(threading.Thread):
         print "####################################"
         print "" 
         print "NEW NETWORKKEY DETECTED: "+networkkey.encode('hex')
-        print ""
-        print ""+networkkey.encode('hex')
+        #print ""
+        #print ""+networkkey.encode('hex')
         print ""
         print "####################################"
         if networkkey not in network_keys:
@@ -196,11 +280,12 @@ class MyThread(threading.Thread):
         return True
 
     def is_beacon_request(self, packet):
-
         global beacon_dot15d4_seqnum
 
         if packet.haslayer(Dot15d4Cmd):
             if packet.cmd_id == 7:
+                #print "Beacon request seen"
+
                 #packet is beacon req. send own beacon as answer
 
                 dot15d4 = Dot15d4FCS() / Dot15d4Beacon()
@@ -218,23 +303,26 @@ class MyThread(threading.Thread):
                 dot15d4.fcf_reserved_2 = 0L
                 
                 dot15d4.seqnum = beacon_dot15d4_seqnum
-                beacon_dot15d4_seqnum = beacon_dot15d4_seqnum + 1
+                beacon_dot15d4_seqnum = (beacon_dot15d4_seqnum + 1) % 255
 
-                dot15d4.src_panid = 4291 
-                dot15d4.src_addr = 0 
+                dot15d4.src_panid = 0x00003eab  # MAGIC # FIXME: Source ZBDevice
+                dot15d4.src_addr = 0            # MAGIC # FIXME: Source ZBDevice
                 dot15d4.aux_sec_header  = None 
+
                 dot15d4.sf_sforder = 15L
                 dot15d4.sf_beaconorder = 15L
-                dot15d4.sf_assocpermit = 1L
+                dot15d4.sf_assocpermit = 0L #1L # MAGIC
                 dot15d4.sf_pancoord = 1L
                 dot15d4.sf_reserved = 0L
                 dot15d4.sf_battlifeextend = 0L
                 dot15d4.sf_finalcapslot = 15L
+
                 dot15d4.gts_spec_permit = 0L
                 dot15d4.gts_spec_reserved = 0L
                 dot15d4.gts_spec_desccount  = 0L
                 dot15d4.gts_dir_reserved = None
                 dot15d4.gts_dir_mask = None
+
                 dot15d4.pa_num_short = 0L
                 dot15d4.pa_reserved_1 = 0L
                 dot15d4.pa_num_long = 0L
@@ -242,41 +330,44 @@ class MyThread(threading.Thread):
 
                 zb_beacon = ZigBeeBeacon()
 
-                proto_id = 0
-                nwkc_protocol_version  = 2L
-                stack_profile = 2L
-                end_device_capacity  = 1L
-                device_depth = 0L
-                router_capacity  = 1L
-                reserved  = 0L
-                extended_pan_id = 9103511905611026439
-                tx_offset = 16777215L
-                update_id = 0
+                zb_beacon.proto_id = 0
+                zb_beacon.nwkc_protocol_version  = 2L
+                zb_beacon.stack_profile = 2L
+                zb_beacon.end_device_capacity  = 1L
+                zb_beacon.device_depth = 0L
+                zb_beacon.router_capacity  = 1L
+                zb_beacon.reserved  = 0L
+                zb_beacon.extended_pan_id = 0x382a96d98567f857L #9103511905611026439 # MAGIC # FIXME: Source ZBDevice
+                zb_beacon.tx_offset = 16777215L
+                zb_beacon.update_id = 0
 
                 new_beacon = dot15d4 / zb_beacon
+
                 print "Beacon sent"
-                time.sleep(0.05)
-                send(new_beacon)
+
+                time.sleep(0.05)    # FIXME: ???
+
+                tracked_send(new_beacon)
+
                 return True
 
         return False
 
     def is_data_request(self, packet):
-
         global scheduled_cmd
         global known_devices
-        global send_packet
-        global acknowledged
+        #global send_packet
+        #global acknowledged
+        #global last_acknowledged
 
         if packet.haslayer(Dot15d4Cmd):
-            print "CMD detected"
+            print "==> CMD detected:", packet.getlayer(Dot15d4Cmd).cmd_id
 
             for device in known_devices:
                 if packet.src_addr == device.short_address:
                     device.dot15d4_seqnumber = packet.seqnum
 
-
-            #PAcket is data request
+            #Packet is data request
             if packet.getlayer(Dot15d4Cmd).cmd_id == 4:
 
                 #search for target device and check if a packet is available
@@ -288,9 +379,14 @@ class MyThread(threading.Thread):
                         for destination in device.destinations:
                             if destination.short_address == packet.src_addr:
                                 #device found now check for packet
-                                if packet.seqnum in acknowledged:
+
+                                # Assume the ACK is not sent by any other device
+                                #if packet.seqnum in acknowledged:
+                                if packet.seqnum == destination.last_acknowledged:
                                     #already acknowledged
-                                    return
+                                    print "Already ACK'd"
+                                #    return
+
                                 if destination.scheduled_packet:
                                     #packet available
                                     #send ack with FP flag set and send scheduled packet
@@ -300,7 +396,9 @@ class MyThread(threading.Thread):
                                     ack.fcf_reserved_1 = 0L
                                     ack.fcf_panidcompress = 0L
                                     ack.fcf_ackreq= 0L
+
                                     ack.fcf_pending = 1L
+
                                     ack.fcf_security = 0L
                                     ack.fcf_frametype = 2L
                                     ack.fcf_srcaddrmode = 0L 
@@ -310,12 +408,20 @@ class MyThread(threading.Thread):
                                     ack.seqnum = packet.seqnum
                                     
                                     packets = []
+
                                     packets.append(ack)
-                                    acknowledged.append(ack.seqnum)
+                                    #acknowledged.append(ack.seqnum)
+                                    destination.last_acknowledged = ack.seqnum
+
+                                    # FIXME: Update seq#?
                                     packets.append(destination.scheduled_packet)
-                                    send(packets)
-                                    send_packet = False
-                                    destination.scheduled_packet = None
+
+                                    tracked_send(packets)
+
+                                    #send_packet = False
+                                    # FIXME
+                                    #destination.scheduled_packet = None
+
                                     print "ACK with FP and scheduled CMD sending"
                                 else:
                                     #no packet scheduled
@@ -326,7 +432,9 @@ class MyThread(threading.Thread):
                                     ack.fcf_reserved_1 = 0L
                                     ack.fcf_panidcompress = 0L
                                     ack.fcf_ackreq= 0L
+
                                     ack.fcf_pending = 0L
+
                                     ack.fcf_security = 0L
                                     ack.fcf_frametype = 2L
                                     ack.fcf_srcaddrmode = 0L 
@@ -334,12 +442,20 @@ class MyThread(threading.Thread):
                                     ack.fcf_destaddrmode = 0L 
                                     ack.fcf_reserved_2 = 0L
                                     ack.seqnum = packet.seqnum
-                                    send(ack)
-                                    acknowledged.append(ack.seqnum)
+
+                                    tracked_send(ack)
+
+                                    #acknowledged.append(ack.seqnum)
+                                    destination.last_acknowledged = ack.seqnum
+
                                     print "ACK without FP set"
-                                    
+                                
+                                print
+
                                 return
 
+                print "NOT sending ACK to unknown device"
+                print
 
     def check_for_keytransport(self,packet):
         if packet.haslayer(scapy.layers.zigbee.ZigbeeSecurityHeader) and str(packet.getlayer(scapy.layers.zigbee.ZigbeeSecurityHeader).key_type) == '2':
@@ -348,21 +464,69 @@ class MyThread(threading.Thread):
             return True
         return False
 
-    def handle_packets(self,packet, seen):
-
+    def handle_packets(self, packet, seen):
         global known_devices
         global network_keys
-        global send_packet
+        #global send_packet
         global send_acks
-        
+        #global last_pending_seqnum
+        global sent_packets
+
+        sent = is_sent_packet(packet.getlayer(Dot15d4FCS)) # Skip GnuradioPacket
+
+        if sent:
+            print "[TX]",
+        else:
+            print "[RX]",
+        print packet.summary()
+
+        if sent:
+            return
+
         #self.relay(packet)
+
+        # These packets don't match "Dot15d4"
+
+        #if last_pending_seqnum > -1:
+        if True:
+            #if packet.haslayer(Dot15d4Ack):    # This packet is never built
+            if packet.haslayer(Dot15d4FCS) and packet.getlayer(Dot15d4FCS).fcf_frametype == 2:
+                #print
+                #print "###########################"
+                #print
+                #if packet.getlayer(Dot15d4FCS).seqnum == last_pending_seqnum:
+                    #print "Received pending seq# %d" % (packet.getlayer(Dot15d4FCS).seqnum)
+                    #send_packet = False
+                if True:
+                    for kd in known_devices:
+                        for d in kd.destinations:   # 'destinations' won't refer to original 'known_devices' instances if loading from pickle
+                            if d.scheduled_packet is not None:
+                                if d.scheduled_packet.haslayer(Dot15d4FCS):
+                                    if d.scheduled_packet.getlayer(Dot15d4FCS).seqnum == packet.getlayer(Dot15d4FCS).seqnum:
+                                        print "Cleared scheduled packet for: 0x%04x (ACK seq# %d)" % (d.short_address, packet.getlayer(Dot15d4FCS).seqnum)
+                                        d.scheduled_packet = None
+
+                    #last_pending_seqnum = -1    # FIXME
+                #else:
+                #    print "Pending seq# mismatch: received %d, expecting %d" % (packet.getlayer(Dot15d4FCS).seqnum, last_pending_seqnum)
+
+                #print
+                #print "###########################"
+                #print
+
         #if send_packet or send_acks:
-        #    self.is_data_request(packet)
-        if not self.check_for_keytransport(packet):
-            self.extract_infos(packet)
+        if send_acks:
+            if self.is_beacon_request(packet):
+                pass
+            else:
+                self.is_data_request(packet)
+
+        if packet.haslayer(Dot15d4Data):
+            if not self.check_for_keytransport(packet):
+                self.extract_infos(packet)
+
         #check if source device is already known
         #if packet.haslayer(Dot15d4Data):
-        
             #check_for_keytransport
         
     def relay(self, packet):
@@ -371,13 +535,13 @@ class MyThread(threading.Thread):
         if packet in seen_packets:
             pass
         else:
-            print "relayed"
-            send(packet)
+            print "Relayed"
+
             seen_packets.append(packet)
 
+            send(packet)
 
 class Gui:
-
     global source_choices
 
     window = Tk()
@@ -420,10 +584,8 @@ class Gui:
     #Device List Block offset
     xDeviceBlockOff=0
     yDeviceBlockOff=0
+
     def __init__(self):
-
-        
-
         self.read_config_file('secbee.conf')
 
         self.stopped = [False,]
@@ -506,7 +668,7 @@ class Gui:
         Checkbutton(self.window, text="Absolute value", variable=self.zb_zadp_absolute).place(x=1030+self.xoff+self.xParametersBlockOff,y=(self.rowPadding+self.rowOffset*7)+self.yoff+self.yParametersBlockOff+2)
         self.zb_zcl_absolute = IntVar()
         Checkbutton(self.window, text="Absolute value", variable=self.zb_zcl_absolute).place(x=1030+self.xoff+self.xParametersBlockOff,y=(self.rowPadding+self.rowOffset*9)+self.yoff+self.yParametersBlockOff+2)
-#.grid(row=13, column = 8, sticky=W)
+        #.grid(row=13, column = 8, sticky=W)
         default = IntVar()
         default.set(1)
         self.frame_counter = Spinbox(self.window, from_=self.framecounter_from, to=self.framecounter_to, textvariable = default)
@@ -570,22 +732,22 @@ class Gui:
         formatmenu.add_command(label="Clear Text", command=self.clear_text)
         menu.add_cascade(label="List", menu=listmenu)
         listmenu.add_command(label="List known devices", command=self.list_devices)
-        listmenu.add_command(label="List known networkkeys", command=self.list_keys)
-
+        listmenu.add_command(label="List known network keys", command=self.list_keys)
 
         ##Button(self.window, text = "Clear text", width = 20, command = self.clear_text).grid(row = 8, column = 2)
 
+        #self.window.protocol("WM_DELETE_WINDOW", self.destroy)
 
-        self.window.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.load_state()
+
         self.window.mainloop()
-
 
     def send_data_request(self):
 
         global known_devices
 
         source = known_devices[int(self.source_value.get().split(" ")[0])]
-        destination = known_devices [int(self.source_value.get().split(" ")[0])].destinations[int(self.destination_value.get().split(" ")[0])]
+        destination = known_devices[int(self.source_value.get().split(" ")[0])].destinations[int(self.destination_value.get().split(" ")[0])]
 
         dot15d4 = Dot15d4FCS() / Dot15d4Cmd()
 
@@ -614,7 +776,9 @@ class Gui:
         dot15d4.cmd_id = 4
         print "data request sent with seq sequence_number "+str(new_dot15d4_seqnum)+" and cmd "+str(dot15d4.cmd_id) 
         print str(dot15d4.do_build().encode('hex'))
-        send(dot15d4)
+
+        tracked_send(dot15d4)
+        
         return True
 
     def send_rejoin_request(self):
@@ -710,17 +874,16 @@ class Gui:
         print "Packet"
         print str(packet.do_build()).encode('hex')
        
-
         #send packet
        
-        print "sent message over serial"
-        send(packet)
-        #send(encpacket)
-        print "sent message over serial"
+        #print "sent message over serial"
+
+        tracked_send(packet)
+        #tracked_send(encpacket)
         
+        #print "sent message over serial"
 
         return True
-
 
     def send_active_endpoint_request(self):
         #select device
@@ -799,21 +962,23 @@ class Gui:
         encpacket = scapy.killerbee.kbencrypt(packet,dec_payload, active_networkkey, 5)
         print "encpacket"
         print str(encpacket.do_build()).encode('hex')
-        send(encpacket)
+
+        tracked_send(encpacket)
 
         return True
 
     def unlock_lock(self):
-         #select device
+        #select device
         global known_devices
         global network_keys
         global active_networkkey
         global scheduled_cmd
-        global send_packet
+        #global send_packet
+        #global last_pending_seqnum
 
-
-        source = known_devices[int(self.source_value.get().split(" ")[0])]
-        destination = known_devices [int(self.source_value.get().split(" ")[0])].destinations[int(self.destination_value.get().split(" ")[0])]
+        # FIXME: Handle when not selected (use helper function)
+        source      = known_devices[int(self.source_value.get().split(" ")[0])]
+        destination = known_devices[int(self.source_value.get().split(" ")[0])].destinations[int(self.destination_value.get().split(" ")[0])]
 
         #create packet
         packet = self.create_dot15d4_packet(source, destination)
@@ -826,23 +991,26 @@ class Gui:
         zbsec.reserved1 = 0L
         zbsec.extended_nonce = 1L 
         zbsec.key_type = 1L
-        zbsec.nwk_seclevel = 0L 
+        zbsec.nwk_seclevel = 0L # Overridden in 'kbencrypt' to 5 (ENC-MIC-32)
         zbsec.fc = destination.frame_counter + int(self.frame_counter.get())
+        print "zbsec.fc =", zbsec.fc
         zbsec.source = source.ext_address
         zbsec.key_seqnum = 0
         zbsec.mic = ''
 
-        #crate ZigbeeAppdataPayload
+        #create ZigbeeAppdataPayload
         zbappdata = ZigbeeAppDataPayload()
 
-        zbappdata.frame_control = 0L
+        # Real hub does set 'ack_req'
+        zbappdata.frame_control = 0L    # [ 'reserved1', 'security', 'ack_req', 'extended_hdr' ]
         zbappdata.delivery_mode = 0L
         zbappdata.aps_frametype = 0L
         zbappdata.dst_endpoint = 1
-        zbappdata.cluster = 257
-        zbappdata.profile = 260
+        zbappdata.cluster = 257 # Door lock
+        zbappdata.profile = 260 # Home automation
         zbappdata.src_endpoint = 1
         zbappdata.counter = destination.zb_zadp_counter + int(self.zb_zadp_counter.get())
+        print "zbappdata.counter =", zbappdata.counter
 
         #create ZigbeeClusterLibrary
         zbclusterlib = ZigbeeClusterLibrary()
@@ -854,24 +1022,54 @@ class Gui:
         zbclusterlib.zcl_frametype = 1L
         zbclusterlib.manufacturer_code = None
 
-        #seqeunce number
+        #sequence number
         zbclusterlib.transaction_sequence = destination.zb_zcl_trans_seq + int(self.zb_zcl_trans_seq.get())
+        print "zbclusterlib.transaction_sequence =", zbclusterlib.transaction_sequence
 
         #the actual command
-        zbclusterlib.command_identifier = 1
+        zbclusterlib.command_identifier = 1     # Unlock
 
         #encrypt and build the packet
         packet = packet / zbsec 
         dec_payload =  zbappdata / zbclusterlib
-        print "Packet"
-        print str(packet.do_build()).encode('hex')
-        print "dec payload"
-        print str(dec_payload.do_build()).encode('hex')
-        print "active network"
-        #send packet
-        encpacket = scapy.killerbee.kbencrypt(packet,dec_payload, active_networkkey, 5)
-        print "encpacket"
-        print str(encpacket.do_build()).encode('hex')
+
+        #print "Packet:"
+        #print str(packet.do_build()).encode('hex')
+
+        #print "dec payload:"
+        #print str(dec_payload.do_build()).encode('hex')
+
+        """
+        encrypt_ccm(key, nonce, mic_size, decrypted_payload, zigbee_data)\n
+        Encrypt data with a 0, 32, 64, or 128-bit MIC\n
+        \n
+        @type key: String\n
+        @param key: 16-byte decryption key\n
+        @type nonce: String\n
+        @param nonce: 13-byte nonce\n
+        type mic_size: Integer\n
+        @param mic_size: the size in bytes of the desired MIC\n
+        @type decrypted_payload: String\n
+        @param decrypted_payload: The decrypted data to encrypt\n
+        @type zigbee_data: String\n
+        @param zigbee_data: The zigbee data within the frame, without the decrypted payload, MIC or FCS
+        """
+
+        encpacket = scapy.killerbee.kbencrypt(
+            packet,
+            dec_payload,
+            active_networkkey,
+            5    # '5' is verbosity
+        )
+
+        #print "encpacket:"
+        #print str(encpacket.do_build()).encode('hex')
+
+        #dec_test = scapy.killerbee.kbdecrypt(encpacket, active_networkkey, 5)
+        #print "dectest:"
+        #print dec_test.summary()
+        #print str(dec_test.do_build()).encode('hex')
+        
         '''
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -881,13 +1079,22 @@ class Gui:
         print 'secbee'+chr(len(encpacket))+encpacket.do_build()
         sock.close()
         '''
-        print "sent message over serial"
-        ser = serial.Serial("/dev/vcom0",38400)
-        x = ser.write('secbee'+chr(len(encpacket))+encpacket.do_build())
-        print ser.readline()
-        ser.close()
-        #send(encpacket)
-        print "sent message over serial"
+
+        #print "sent message over serial"
+        #ser = serial.Serial("/dev/vcom0",38400)
+        #x = ser.write('secbee'+chr(len(encpacket))+encpacket.do_build())
+        #print ser.readline()
+        #ser.close()
+        
+        #tracked_send(encpacket)
+
+        destination.scheduled_packet = encpacket
+        #last_pending_seqnum = packet.seqnum
+        print "Scheduled packet (#%d)" % (packet.seqnum)
+        print
+        #send_packet = True
+
+        #print "sent message over serial"
 
         return True
 
@@ -897,7 +1104,7 @@ class Gui:
         global network_keys
         global active_networkkey
         global scheduled_cmd
-        global send_packet
+        #global send_packet
 
         source = known_devices[int(self.source_value.get().split(" ")[0])]
         destination = known_devices [int(self.source_value.get().split(" ")[0])].destinations[int(self.destination_value.get().split(" ")[0])]
@@ -945,10 +1152,9 @@ class Gui:
         print "encpacket"
         print str(encpacket.do_build()).encode('hex')
 
-        send(packet / dec_payload)
+        tracked_send(packet / dec_payload)
 
         return True
-
 
     def lock_lock(self):
         #select device
@@ -956,7 +1162,7 @@ class Gui:
         global network_keys
         global active_networkkey
         global scheduled_cmd
-        global send_packet
+        #global send_packet
 
         source = known_devices[int(self.source_value.get().split(" ")[0])]
         destination = known_devices [int(self.source_value.get().split(" ")[0])].destinations[int(self.destination_value.get().split(" ")[0])]
@@ -1019,19 +1225,19 @@ class Gui:
         print "encpacket"
         print str(encpacket.do_build()).encode('hex')
 
-        print "sent message over serial"
-        ser = serial.Serial("/dev/vcom0",38400)
-        x = ser.write('secbee'+chr(len(encpacket))+encpacket.do_build())
-        print ser.readline()
-        ser.close()
-        #send(encpacket)
-        print "sent message over serial"
+        #print "sent message over serial"
+        #ser = serial.Serial("/dev/vcom0",38400)
+        #x = ser.write('secbee'+chr(len(encpacket))+encpacket.do_build())
+        #print ser.readline()
+        #ser.close()
+
+        tracked_send(encpacket)
+
+        #print "sent message over serial"
         
         return True
 
     def send_motion(self, cmd):
-
-
         #select device
         global known_devices
         global network_keys
@@ -1132,12 +1338,12 @@ class Gui:
         encpacket = scapy.killerbee.kbencrypt(packet,dec_payload, active_networkkey, 5)
         print "encpacket"
         print str(encpacket.do_build()).encode('hex')
-        send(encpacket)
+
+        tracked_send(encpacket)
 
         return True
 
     def send_on_off(self,cmd):
-
         #select device
         global known_devices
         global network_keys
@@ -1210,7 +1416,8 @@ class Gui:
         encpacket = scapy.killerbee.kbencrypt(packet,dec_payload, active_networkkey, 5)
         print "encpacket"
         print str(encpacket.do_build()).encode('hex')
-        send(encpacket)
+
+        tracked_send(encpacket)
 
         return True
 
@@ -1220,6 +1427,7 @@ class Gui:
         #Fill Dot15d4FCS
         dot15d4.fcf_reserved_1 = 0L
         dot15d4.fcf_panidcompress = 1L
+
         dot15d4.fcf_ackreq= 1L
         dot15d4.fcf_pending = 0L
         dot15d4.fcf_security = 0L
@@ -1227,11 +1435,17 @@ class Gui:
         dot15d4.fcf_srcaddrmode = 2L 
         dot15d4.fcf_framever=0L
         dot15d4.fcf_destaddrmode = 2L 
+
         dot15d4.fcf_reserved_2 = 0L
+
         new_dot15d4_seqnum = (source.dot15d4_seqnumber + int(self.dot15d4_seqnumber.get()))%255
+
+        # FIXME ???
         if new_dot15d4_seqnum == 0:
             new_dot15d4_seqnum = 1
+
         dot15d4.seqnum = new_dot15d4_seqnum
+        print "dot15d4.seqnum =", dot15d4.seqnum
 
         #Fill Dot15d4Data
         dot15d4.dest_panid = destination.pan_id
@@ -1249,14 +1463,19 @@ class Gui:
         zbnwk.discover_route = 1L 
         zbnwk.proto_version = 2L
         zbnwk.frametype = 0L
-        zbnwk.flags  =  2L
+        zbnwk.flags  =  2L  # security from ['multicast', 'security', 'source_route', 'extended_dst', 'extended_src', 'reserved1', 'reserved2', 'reserved3']
         zbnwk.destination   = destination.short_address
         zbnwk.source = source.short_address
         zbnwk.radius = 30
         new_zbnwk_seqnum = (destination.zb_nwk_seqnumber + int(self.zb_nwk_seqnumber.get()))%255
+
+        # FIXME ???
         if new_zbnwk_seqnum == 0:
             new_zbnwk_seqnum = 1
+
         zbnwk.seqnum = new_zbnwk_seqnum
+        print "zbnwk.seqnum =", zbnwk.seqnum
+
         zbnwk.relay_count  = None
         zbnwk.relay_index  = None
         zbnwk.relays  = None
@@ -1291,7 +1510,7 @@ class Gui:
         i = 0
 
         self.T.insert(END,"ZB Key: " + zb_defaultkey +"\n")
-        self.T.insert(END,"Active networkkey: " + str(active_networkkey.encode('hex')) +  "\n")
+        self.T.insert(END,"Active network key: " + str(active_networkkey.encode('hex')) +  "\n")
         self.T.insert(END, "Network Keys detected: \n\n")
 
         for key in network_keys:
@@ -1308,30 +1527,57 @@ class Gui:
         global knowndevices_file
         global source_choices
 
-        network_keys = pickle.load(open(networkkeys_file,"rb"))
-        known_devices = pickle.load(open(knowndevices_file,"rb"))
-        source_choices = list()
-        i = 0
-        for device in known_devices:
-            source_choices.append(str(i) + " ("+str(device.short_address)+")")
-            i = i + 1
-        self.source_value.set('') #Initial Value
-        self.source_om.destroy()
-        self.source_om = OptionMenu(self.window, self.source_value, *source_choices)
-        self.source_om.config(width = 14)
-        self.source_om.place(x=180+self.xoff+self.xCommandsBlockOff,y=(self.rowPadding+self.rowOffset*0)+self.yoff+self.yCommandsBlockOff)
+        print "Loading:", networkkeys_file
+        try:
+            with open(networkkeys_file,"rb") as f:
+                network_keys = pickle.load(f)
+        except Exception, e:
+            print e
+
+        print "Loading:", knowndevices_file
+        try:
+            with open(knowndevices_file,"rb") as f:
+                known_devices = pickle.load(f)
+
+            source_choices = list()
+            i = 0
+            for device in known_devices:
+                source_choices.append(str(i) + " ("+str(device.short_address)+")")
+                i = i + 1
+            self.source_value.set('') #Initial Value
+            self.source_om.destroy()
+            self.source_om = OptionMenu(self.window, self.source_value, *source_choices)
+            self.source_om.config(width = 14)
+            self.source_om.place(x=180+self.xoff+self.xCommandsBlockOff,y=(self.rowPadding+self.rowOffset*0)+self.yoff+self.yCommandsBlockOff)
+        except Exception, e:
+            print e
+
         self.list_devices()
+
         #dir = tkFileDialog.askdirectory(parent=window,initialdir=".",title='Choose a directory')
         #if dir != None:
         #    network_keys = pickle.load(open(dir+'/'+networkkeys_file,"rb"))
         #    known_devices = pickle.load(open(dir+'/'+knowndevices_file,"rb"))
+
         return
 
     def save_state(self):
         global network_keys
         global known_devices
+
+        print "Saving state..."
+
         pickle.dump(network_keys,open("networkkeys.p","wb"))
+
+        # FIXME: Restore them afterward, or just store the build and not the packet object
+        for kd in known_devices:
+            for d in kd.destinations:   # 'destinations' won't refer to original 'known_devices' instances if loading from pickle
+                if d.scheduled_packet is not None:
+                    print "Clearing scheduled packet for 0x%04x: %s" % (d.short_address, d.scheduled_packet.summary())
+                    d.scheduled_packet = None
+
         pickle.dump(known_devices,open("knowndevices.p","wb"))
+
         return
 
     def save_state_as(self):
@@ -1344,16 +1590,23 @@ class Gui:
         fileName = tkFileDialog.asksaveasfilename(parent=self.window,filetypes=myFormats ,title="Save the network keys as...")
         if len(fileName ) > 0:
             pickle.dump(network_keys,open(fileName,"wb"))
+
         fileName = tkFileDialog.asksaveasfilename(parent=self.window,filetypes=myFormats ,title="Save the known devices as...")
         if len(fileName ) > 0:
             pickle.dump(known_devices,open(fileName,"wb"))
+
         return
+
     def start_sniffing(self):
+
+        print "Starting sniffing..."
         
         os.system("rm /tmp/secbee.pcap")
-        os.system("mkfifo /tmp/secbee.pcap")           
+        os.system("mkfifo /tmp/secbee.pcap")
+
         self.sniff = MyThread()
         self.sniff.start()
+
         os.system("wireshark -k -i \"/tmp/secbee.pcap\" &")
 
     def read_config_file(self, config_file_name):
@@ -1361,6 +1614,8 @@ class Gui:
         global zb_defaultkey
         global networkkeys_file
         global knowndevices_file
+
+        print "Reading from:", config_file_name
 
         # read configuration
         config_file = open(config_file_name, 'r')
@@ -1374,7 +1629,9 @@ class Gui:
         knowndevices_file = config.get('files', 'knowndevices_file')
         self.framecounter_from = config.get('values', 'framecounter_from')
         self.framecounter_to = config.get('values', 'framecounter_to')
-        #print "Active network key" + active_networkkey.encode('hex')
+
+        print "Active network key: " + active_networkkey.encode('hex')
+
         config_file.close()
 
     def destination_updater(self, *args):
@@ -1389,7 +1646,7 @@ class Gui:
             self.destination_choices = []
             i = 0
             for destinations in device.destinations:
-                self.destination_choices.append(str(i) + " ("+str(device.short_address)+")")
+                self.destination_choices.append(str(i) + " ("+str(destinations.short_address)+")")
                 i = i + 1
             self.destination_value.set('') #Initial Value
             if self.destination_choices:
@@ -1400,7 +1657,6 @@ class Gui:
                 self.dest_om = OptionMenu(self.window, self.destination_value, '')
                 self.dest_om.config(width = 14)
                 self.dest_om.place(x=180+self.xoff+self.xCommandsBlockOff, y=(self.rowPadding+self.rowOffset*1)+self.rowLabelOffset+self.yoff+self.yCommandsBlockOff)
-
 
     def listbox_trace(self, evt):
         self.detailbox.delete(0, END)
@@ -1435,10 +1691,14 @@ class Gui:
 
         send_acks = True
 
+        print "Sending ACKs"
+
     def stop_acks(self):
         global send_acks
 
         send_acks = False
+
+        print "Not sending ACKs"
 
     def stop_sniffing(self):
         
@@ -1447,14 +1707,20 @@ class Gui:
     
     def destroy(self):
         #self.sniff._Thread__stop()
-        print "destroy"
-        call(["pkill","-f","top_block.py"])
-        call(["pkill","-f","SecBee.py"])
-        call(["echo","test"])
+        #print "destroy"
+
+        #call(["pkill","-f","top_block.py"])
+        #call(["pkill","-f","SecBee.py"])
+
+        #call(["echo","test"])
         
         #sleep(1000)
-        sys.exit()
 
+        print "Exiting..."
+
+        # FIXME: End sniffing thread
+
+        #sys.exit()
     
     #gui.T.insert(END,"New packet seen")
 
@@ -1463,12 +1729,10 @@ def main():
     load_layer('zigbee')
 
     gui = Gui()
-    print "GUI created"
+
+    #print "GUI created"
     #switch_radio_protocol("Zigbee")
-    print "exit"
+    print "Exit"
 
-if  __name__ =='__main__':main()
-
-
-
-
+if  __name__ =='__main__':
+    main()

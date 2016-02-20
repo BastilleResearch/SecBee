@@ -146,7 +146,7 @@ static void zbee_sec_hash(char *input, uint input_len, char *output)
  *      guint8*
  *---------------------------------------------------------------
  */
-static char *zbee_sec_key_hash(char *key, char input, char *hash_out)
+static char *zbee_sec_key_hash(const char *key, char input, char *hash_out)
 {
     char              hash_in[2*ZBEE_SEC_CONST_BLOCKSIZE];
     int                 i;
@@ -180,8 +180,7 @@ static PyObject *zigbee_crypt_calc_transkey(PyObject *self, PyObject *args){
     
     zbee_sec_key_hash(netKey, 0x00, buffer);
    
-    return buffer;
-
+    return Py_BuildValue("s#", buffer, ZBEE_SEC_CONST_BLOCKSIZE);
 };
 
 static PyObject *zigbee_crypt_encrypt_ccm(PyObject *self, PyObject *args) {

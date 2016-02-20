@@ -181,10 +181,7 @@ static PyObject *zigbee_crypt_calc_transkey(PyObject *self, PyObject *args){
     
     zbee_sec_key_hash(netKey, 0x00, buffer);
     
-    return Py_BuildValue("s",buffer);
-
-    //return buffer
-
+    return Py_BuildValue("s#", buffer, ZBEE_SEC_CONST_BLOCKSIZE);
 };
 
 
